@@ -2,7 +2,7 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.experimental.ode import odeint
+from experimental.ode import odeint
 
 
 class ResDownBlock(hk.Module):
@@ -111,8 +111,8 @@ if __name__ == '__main__':
         return module(x)
 
     def _forward_ode_func(x, t):
-        # nfe = hk.get_state("NFE", shape=[], dtype=jnp.int32, init=jnp.ones)
-        # hk.set_state("NFE", nfe + 1)
+        nfe = hk.get_state("NFE", shape=[], dtype=jnp.int32, init=jnp.ones)
+        hk.set_state("NFE", nfe + 1)
         module = ODEfunc(64)
         return module(x, t)
 
@@ -130,14 +130,14 @@ if __name__ == '__main__':
 
     dummy_x2 = pre_fn(params=pre_params, x=dummy_x)
 
-    odefunc_forward = hk.without_apply_rng(hk.transform(_forward_ode_func))
-    odefunc_params = odefunc_forward.init(rng=rng_key, x=dummy_x2, t=dummy_t)
+    odefunc_forward = hk.without_apply_rng(hk.transform_with_state(_forward_ode_func))
+    odefunc_params, state = odefunc_forward.init(rng=rng_key, x=dummy_x2, t=dummy_t)
     odefunc_fn = odefunc_forward.apply
 
-    def odeblock(x, params, tol):
-        odefunc_apply = lambda x, t: odefunc_fn(params=params, x=x, t=t)
+    def odeblock(x, params, state, tol):
+        odefunc_apply = lambda x, t, state: odefunc_fn(params=params, state=state, x=x, t=t)
         states = odeint(odefunc_apply,
-                        x, jnp.array([0., 1.]),
+                        x, jnp.array([0., 1.]), state,
                         rtol=tol, atol=tol)
         return states[-1]
 
@@ -146,7 +146,7 @@ if __name__ == '__main__':
     post_fn = post_forward.apply
 
     output = pre_fn(params=pre_params, x=dummy_x)
-    output = odeblock(x=output, params=odefunc_params, tol=1.)
+    output = odeblock(x=output, params=odefunc_params, state=state, tol=1.)
     output = post_fn(params=post_params, x=output)
 
     print("Dummy output: \n", output)

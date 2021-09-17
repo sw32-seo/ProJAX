@@ -13,12 +13,15 @@
 # limitations under the License.
 
 """JAX-based Dormand-Prince ODE integration with adaptive stepsize.
+
 Integrate systems of ordinary differential equations (ODEs) using the JAX
 autograd/diff library and the Dormand-Prince method for adaptive integration
 stepsize calculation. Provides improved integration accuracy over fixed
 stepsize integration methods.
+
 For details of the mixed 4th/5th order Runge-Kutta integration method, see
 https://doi.org/10.1090/S0025-5718-1986-0815836-3
+
 Adjoint algorithm based on Appendix C of https://arxiv.org/pdf/1806.07366.pdf
 """
 
@@ -73,13 +76,13 @@ def initial_step_size(fun, t0, y0, order, rtol, atol, f0):
   # Solving Ordinary Differential Equations I: Nonstiff Problems, Sec. II.4.
   scale = atol + jnp.abs(y0) * rtol
   d0 = jnp.linalg.norm(y0 / scale)
-  d1 = jnp.linalg.norm(f0 / scale)
+  d1 = jnp.linalg.norm(f0[:-1] / scale)
 
   h0 = jnp.where((d0 < 1e-5) | (d1 < 1e-5), 1e-6, 0.01 * d0 / d1)
 
-  y1 = y0 + h0 * f0
+  y1 = y0 + h0 * f0[:-1]
   f1 = fun(y1, t0 + h0)
-  d2 = jnp.linalg.norm((f1 - f0) / scale) / h0
+  d2 = jnp.linalg.norm((f1[:-1] - f0[:-1]) / scale) / h0
 
   h1 = jnp.where((d1 <= 1e-15) & (d2 <= 1e-15),
                 jnp.maximum(1e-6, h0 * 1e-3),
@@ -141,6 +144,7 @@ def optimal_step_size(last_step, mean_error_ratio, safety=0.9, ifactor=10.0,
 
 def odeint(func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, mxstep=jnp.inf):
   """Adaptive stepsize (Dormand-Prince) Runge-Kutta odeint implementation.
+
   Args:
     func: function to evaluate the time derivative of the solution `y` at time
       `t` as `func(y, t, *args)`, producing the same shape/structure as `y0`.
@@ -153,6 +157,7 @@ def odeint(func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, mxstep=jnp.inf):
     rtol: float, relative local error tolerance for solver (optional).
     atol: float, absolute local error tolerance for solver (optional).
     mxstep: int, maximum number of steps to take for each timepoint (optional).
+
   Returns:
     Values of the solution `y` (i.e. integrated system values) at each time
     point in `t`, represented as an array (or pytree of arrays) with the same
@@ -171,8 +176,8 @@ def odeint(func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, mxstep=jnp.inf):
 def _odeint_wrapper(func, rtol, atol, mxstep, y0, ts, *args):
   y0, unravel = ravel_pytree(y0)
   func = ravel_first_arg(func, unravel)
-  out, nfe = _odeint(func, rtol, atol, mxstep, y0, ts, *args)
-  return jax.vmap(unravel)(out), nfe
+  out = _odeint(func, rtol, atol, mxstep, y0, ts, *args)
+  return jax.vmap(unravel)(out)
 
 @partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3))
 def _odeint(func, rtol, atol, mxstep, y0, ts, *args):
@@ -196,30 +201,25 @@ def _odeint(func, rtol, atol, mxstep, y0, ts, *args):
       old = [i + 1,      y,      f,      t, dt, last_t,     interp_coeff]
       return map(partial(jnp.where, jnp.all(error_ratios <= 1.)), new, old)
 
-    nfe = carry[-1]
-    n_steps, *carry = lax.while_loop(cond_fun, body_fun, [0] + carry[:-1])
-    carry = carry + [nfe + 6. * n_steps]
-    _, _, t, _, last_t, interp_coeff = carry[:-1]
+    _, *carry = lax.while_loop(cond_fun, body_fun, [0] + carry)
+    _, _, t, _, last_t, interp_coeff = carry
     relative_output_time = (target_t - last_t) / (t - last_t)
     y_target = jnp.polyval(interp_coeff, relative_output_time)
     return carry, y_target
 
   f0 = func_(y0, ts[0])
-  init_nfe = 1.
   dt = initial_step_size(func_, ts[0], y0, 4, rtol, atol, f0)
   interp_coeff = jnp.array([y0] * 5)
-  init_carry = [y0, f0, ts[0], dt, ts[0], interp_coeff, init_nfe]
-  carry, ys = lax.scan(scan_fun, init_carry, ts[1:])
-  nfe = carry[-1]
-  return jnp.concatenate((y0[None], ys)), nfe
+  init_carry = [y0, f0, ts[0], dt, ts[0], interp_coeff]
+  _, ys = lax.scan(scan_fun, init_carry, ts[1:])
+  return jnp.concatenate((y0[None], ys))
 
 def _odeint_fwd(func, rtol, atol, mxstep, y0, ts, *args):
-  ys, nfe = _odeint(func, rtol, atol, mxstep, y0, ts, *args)
-  return (ys, nfe), (ys, ts, args)
+  ys = _odeint(func, rtol, atol, mxstep, y0, ts, *args)
+  return ys, (ys, ts, args)
 
 def _odeint_rev(func, rtol, atol, mxstep, res, g):
   ys, ts, args = res
-  g, _ = g
 
   def aug_dynamics(augmented_state, t, *args):
     """Original system augmented with vjp_y, vjp_t and vjp_args."""
@@ -243,7 +243,7 @@ def _odeint_rev(func, rtol, atol, mxstep, res, g):
     _, y_bar, t0_bar, args_bar = odeint(
         aug_dynamics, (ys[i], y_bar, t0_bar, args_bar),
         jnp.array([-ts[i], -ts[i - 1]]),
-        *args, rtol=rtol, atol=atol, mxstep=mxstep)[0]
+        *args, rtol=rtol, atol=atol, mxstep=mxstep)
     y_bar, t0_bar, args_bar = tree_map(op.itemgetter(1), (y_bar, t0_bar, args_bar))
     # Add gradient from current output
     y_bar = y_bar + g[i - 1]
