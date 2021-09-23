@@ -1,7 +1,6 @@
 import haiku as hk
 import jax
 import jax.numpy as jnp
-import numpy as np
 from experimental.ode import odeint
 
 
@@ -103,9 +102,6 @@ class PostODE(hk.Module):
 
 
 if __name__ == '__main__':
-    import os
-    os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-
     def _forward_pre_ode(x):
         module = PreODE(64)
         return module(x)
