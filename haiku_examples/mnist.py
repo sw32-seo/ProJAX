@@ -8,12 +8,14 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 import numpy as np
+import tensorflow as tf
 import optax
 import tensorflow_datasets as tfds
 import os
 
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+# For me, tfds and jax struggles to get GPU memory. Below will prohibit using GPU memory by TF.
+tf.config.experimental.set_visible_devices([], "GPU")
 Batch = Mapping[str, np.ndarray]    # Mapping is dict-like which can use __getitem__
 
 
@@ -51,4 +53,66 @@ def main(_):
     # Training loss (cross-entropy).
     def loss(params: hk.Params, batch: Batch) -> jnp.ndarray:
         """Compute the loss of the network, including L2."""
-        
+        logits = net.apply(params, batch)
+        labels = jax.nn.one_hot(batch["label"], 10)
+
+        l2_loss = 0.5 * sum(jnp.sum(jnp.square(p)) for p in jax.tree_leaves(params))    # l2_norm of parameters
+        softmax_xent = -jnp.sum(labels * jax.nn.log_softmax(logits))
+        softmax_xent /= labels.shape[0]
+
+        return softmax_xent + 1e-4 * l2_loss
+
+    # Evaluation metric (classification accuracy).
+    @jax.jit
+    def accuracy(params: hk.Params, batch: Batch) -> jnp.ndarray:
+        predictions = net.apply(params, batch)
+        return jnp.mean(jnp.argmax(predictions, axis=-1) == batch["label"])
+
+    @jax.jit
+    def update(
+            params: hk.Params,
+            opt_state: optax.OptState,
+            batch: Batch,
+    ) -> Tuple[hk.Params, optax.OptState]:
+        """Learning rule (stochastic gradient descent)."""
+        grads = jax.grad(loss)(params, batch)
+        updates, opt_state = opt.update(grads, opt_state)
+        new_params = optax.apply_updates(params, updates)
+        return new_params, opt_state
+
+    # DeepMind's comment
+    # We maintain avg_params, the exponential moving average of the "live" params.
+    # avg_params is used only for evaluation (cf. https://doi.org/10.1137/0330046)
+    @jax.jit
+    def ema_update(params, avg_params):
+        return optax.incremental_update(params, avg_params, step_size=0.001)
+
+    # Make datasets.
+    train = load_dataset("train", is_training=True, batch_size=1000)
+    train_eval = load_dataset("train", is_training=False, batch_size=10000)
+    test_eval = load_dataset("test", is_training=False, batch_size=10000)
+
+    # Initialize network and optimizer; note we draw an input to get shapes.
+    params = avg_params = net.init(jax.random.PRNGKey(42), next(train))
+    opt_state = opt.init(params)
+
+    # Train/eval loop.
+    for step in range(10001):
+        if step % 1000 == 0:
+            # Periodically evaluate classification accuracy on train & test sets.
+            train_accuracy = accuracy(avg_params, next(train_eval))
+            test_accuracy = accuracy(avg_params, next(test_eval))
+            train_loss = loss(params, next(train_eval))
+            train_loss = jax.device_get(train_loss)
+            train_accuracy, test_accuracy = jax.device_get(
+                (train_accuracy, test_accuracy))
+            print(f"Step {step}] Train / Test accuracy / Train loss: "
+                  f"{train_accuracy:.3f} / {test_accuracy:.3f} / {train_loss:.3f}.")
+
+        # Do SGD on a batch of training examples.
+        params, opt_state = update(params, opt_state, next(train))
+        avg_params = ema_update(params, avg_params)
+
+
+if __name__ == '__main__':
+    app.run(main)
