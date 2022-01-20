@@ -6,7 +6,6 @@ import tensorflow_datasets as tfds
 import optax
 
 
-
 # Define loss
 @jax.jit
 def cross_entropy_loss(logits, labels):
