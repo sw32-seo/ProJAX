@@ -43,19 +43,27 @@ class ResBlock(hk.Module):
 
 class ResDownBlock(hk.Module):
     """Standard ResBlock w/ downsampling"""
-    def __init__(self, dim_out=64):
+
+    def __init__(self, inplanes, planes, stride=2, downsample=None):
         super(ResDownBlock, self).__init__()
-        self.dim_out = dim_out
-        self.groupnorm = hk.GroupNorm(self.dim_out)
+        self.norm1 = norm(inplanes)
+        self.relu = jax.nn.relu
+        self.downsample = downsample
+        self.conv1 = conv3x3(planes, stride)
+        self.norm2 = norm(planes)
+        self.conv2 = conv3x3(planes)
 
     def __call__(self, x):
-        f_x = jax.nn.relu(self.groupnorm(x))
-        x = hk.Conv2D(self.dim_out, 1, 2)(x)
-        f_x = hk.Conv2D(self.dim_out, 3, 2)(f_x)
-        f_x = jax.nn.relu(hk.GroupNorm(self.dim_out)(f_x))
-        f_x = hk.Conv2D(self.dim_out, 3, 1)(f_x)
-        x = f_x + x
-        return x
+        out = self.relu(self.norm1(x))
+
+        shortcut = self.downsample(out)
+
+        out = self.conv1(out)
+        out = self.norm2(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+
+        return out + shortcut
 
 
 class ConcatConv2D(hk.Module):
@@ -97,9 +105,10 @@ class ODEfunc(hk.Module):
 
 class ODEBlock(hk.Module):
     """ODE block"""
-    def __init__(self, odefunc):
+    def __init__(self, odefunc, tol):
         super(ODEBlock, self).__init__()
         self.odefunc = odefunc
+        self.tol = tol
 
     def __call__(self, x):
         integration_time = jnp.array([0., 1.], dtype=x.dtype)
@@ -107,75 +116,52 @@ class ODEBlock(hk.Module):
             out = self.odefunc(x, 1.)
             return out
         else:
-            out = odeint(self.odefunc, x, integration_time, rtol=1e-3, atol=1e-3)
+            out = odeint(self.odefunc, x, integration_time, rtol=self.tol, atol=self.tol)
             return out[-1]
 
 
 class PostODE(hk.Module):
     """Post ODE Block"""
-    def __init__(self, dim_out, n_cls):
+    def __init__(self, dim, n_cls):
         super(PostODE, self).__init__()
-        self.dim_out = dim_out
-        self.n_cls = n_cls
+        self.norm = norm(dim)
+        self.relu = jax.nn.relu
+        self.avgpool = hk.AvgPool(window_shape=(1, 1), strides=1, padding='SAME')
+        self.flatten = hk.Flatten(1)
+        self.linear = hk.Linear(output_size=n_cls)
 
     def __call__(self, x):
-        x = hk.GroupNorm(self.dim_out)(x)
-        x = jax.nn.relu(x)
-        x = hk.AvgPool(2, 1, "SAME")(x)
-
-        x = hk.Flatten()(x)
-        x = hk.Linear(output_size=self.n_cls)(x)
-        x = jax.nn.log_softmax(x)
-
+        x = self.norm(x)
+        x = self.relu(x)
+        x = self.avgpool(x)
+        x = self.flatten(x)
+        x = self.linear(x)
         return x
 
 
 if __name__ == '__main__':
 
-    os.environ['CUDA_VISIBLE_DEVICES'] = ''
+    def _foward_fn_node(x):
+        conv = hk.Conv2D(64, 3, 1)
+        module1 = ResDownBlock(64, 64, stride=2, downsample=conv1x1(64, 2))
+        module2 = ResDownBlock(64, 64, stride=2, downsample=conv1x1(64, 2))
+        feature_layer = ODEBlock(ODEfunc(64), 1e-3)
+        fc_layers = PostODE(64, 10)
 
-    def _forward_pre_ode(x):
-        module = PreODE(64)
-        return module(x)
+        out = conv(x)
+        out = module1(out)
+        out = module2(out)
+        out = feature_layer(out)
+        out = fc_layers(out)
 
-    def _forward_ode_func(x, t):
-        nfe = hk.get_state("NFE", shape=[], dtype=jnp.int32, init=jnp.ones)
-        hk.set_state("NFE", nfe + 1)
-        module = ODEfunc(64)
-        return module(x, t)
+        return out
 
-    def _forward_post_ode(x):
-        module = PostODE(64, 10)
-        return module(x)
+    forward_node = hk.without_apply_rng(hk.transform(_foward_fn_node))
 
     dummy_x = jnp.ones([1, 28, 28, 1])
     dummy_t = 1.
-    rng_key = jax.random.PRNGKey(2021)
+    rng_key = jax.random.PRNGKey(42)
 
-    pre_forward = hk.without_apply_rng(hk.transform(_forward_pre_ode))
-    pre_params = pre_forward.init(rng=rng_key, x=dummy_x)
-    pre_fn = pre_forward.apply
+    params = forward_node.init(rng=rng_key, x=dummy_x)
 
-    dummy_x2 = pre_fn(params=pre_params, x=dummy_x)
-
-    odefunc_forward = hk.without_apply_rng(hk.transform_with_state(_forward_ode_func))
-    odefunc_params, state = odefunc_forward.init(rng=rng_key, x=dummy_x2, t=dummy_t)
-    odefunc_fn = odefunc_forward.apply
-
-    def odeblock(x, params, state, tol):
-        odefunc_apply = lambda x, t, state: odefunc_fn(params=params, state=state, x=x, t=t)
-        states = odeint(odefunc_apply,
-                        x, jnp.array([0., 1.]), state,
-                        rtol=tol, atol=tol)
-        return states[-1]
-
-    post_forward = hk.without_apply_rng(hk.transform(_forward_post_ode))
-    post_params = post_forward.init(rng=rng_key, x=dummy_x2)
-    post_fn = post_forward.apply
-
-    output = pre_fn(params=pre_params, x=dummy_x)
-    output = odeblock(x=output, params=odefunc_params, state=state, tol=1.)
-    output = post_fn(params=post_params, x=output)
-
-    print("Dummy output: \n", output)
-    # print("NFE: %d" % nfe)
+    print(params)
