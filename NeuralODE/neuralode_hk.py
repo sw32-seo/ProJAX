@@ -105,9 +105,9 @@ class ODEfunc(hk.Module):
 
 class ODEBlock(hk.Module):
     """ODE block"""
-    def __init__(self, odefunc, tol):
+    def __init__(self, dim, tol):
         super(ODEBlock, self).__init__()
-        self.odefunc = odefunc
+        self.odefunc = ODEfunc(dim)
         self.tol = tol
 
     def __call__(self, x):
@@ -145,7 +145,7 @@ if __name__ == '__main__':
         conv = hk.Conv2D(64, 3, 1)
         module1 = ResDownBlock(64, 64, stride=2, downsample=conv1x1(64, 2))
         module2 = ResDownBlock(64, 64, stride=2, downsample=conv1x1(64, 2))
-        feature_layer = ODEBlock(ODEfunc(64), 1e-3)
+        feature_layer = ODEBlock(64, 1e-3)
         fc_layers = PostODE(64, 10)
 
         out = conv(x)

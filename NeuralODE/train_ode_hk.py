@@ -12,6 +12,8 @@ from neuralode_hk import ResDownBlock, ODEBlock, ODEfunc, PostODE, conv1x1
 # For me, tfds and jax struggles to get GPU memory. Below will prohibit using GPU memory by TF.
 tf.config.experimental.set_visible_devices([], "GPU")
 
+# TODO: Add absl argument for hyperparameters
+
 
 def load_dataset(
         split: str,
@@ -32,7 +34,7 @@ def _foward_fn_node(batch):
     conv = hk.Conv2D(64, 3, 1)
     module1 = ResDownBlock(64, 64, stride=2, downsample=conv1x1(64, 2))
     module2 = ResDownBlock(64, 64, stride=2, downsample=conv1x1(64, 2))
-    feature_layer = ODEBlock(ODEfunc(64), 1e-3)
+    feature_layer = ODEBlock(dim=64, tol=1e-3)
     fc_layers = PostODE(64, 10)
 
     out = conv(x)
@@ -49,6 +51,7 @@ def main(_):
     opt = optax.adam(learning_rate=1e-4)
 
     # Training loss (cross-entropy).
+    @jax.jit
     def loss(params, batch):
         """Compute the loss of the network, including L2."""
         logits = odenet.apply(params, batch)
@@ -78,12 +81,12 @@ def main(_):
         return optax.incremental_update(params, avg_params, step_size=0.001)
 
     # Make datasets.
-    train = load_dataset("train", is_training=True, batch_size=1000)
+    train = load_dataset("train", is_training=True, batch_size=128)
     train_eval = load_dataset("train", is_training=False, batch_size=10000)
     test_eval = load_dataset("test", is_training=False, batch_size=10000)
 
     # Initialize network and optimizer; note we draw an input to get shapes.
-    params = avg_params = odenet.init(jax.random.PRNGKey(42), next(train))
+    params = avg_params = odenet.init(rng=jax.random.PRNGKey(42), batch=next(train))
     opt_state = opt.init(params)
 
     # Train/eval loop.
