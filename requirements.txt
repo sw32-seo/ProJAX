@@ -1,4 +1,10 @@
 numpy
+wheel
+ml-dtypes==0.2.0
+jax
+flax
+clu
+chex
 matplotlib
 absl-py
 tensorflow

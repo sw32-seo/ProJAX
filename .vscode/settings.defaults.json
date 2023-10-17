@@ -1,0 +1,37 @@
+{
+    "python.testing.pytestArgs": [
+        "tests"
+    ],
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestEnabled": true,
+    "python.terminal.activateEnvironment": true,
+    "python.terminal.activateEnvInCurrentTerminal": true,
+    "editor.codeActionsOnSave": {
+        "source.organizeImports": true
+    },
+    "files.insertFinalNewline": true,
+    "files.trimFinalNewlines": true,
+    "[python]": {
+        "diffEditor.ignoreTrimWhitespace": false,
+        "editor.defaultFormatter": "eeyore.yapf",
+        "editor.formatOnSaveMode": "file",
+        "editor.formatOnSave": true,
+        "editor.wordBasedSuggestions": false,
+        "files.trimTrailingWhitespace": true
+    },
+    "python.analysis.typeCheckingMode": "basic",
+    "python.languageServer": "Pylance",
+    "files.exclude": {
+        "**/*$py.class": true
+    },
+    "json.schemas": [
+        {
+            "fileMatch": [
+                "/.vscode/settings.default.json"
+            ],
+            "url": "vscode://schemas/settings/folder"
+        }
+    ],
+    "workspace-default-settings.runOnActivation": true,
+    "workspace-default-settings.jsonIndentation": 4
+}
