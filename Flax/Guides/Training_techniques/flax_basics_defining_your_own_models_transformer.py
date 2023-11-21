@@ -62,14 +62,13 @@ class GPT2Block(nn.Module):
         return hidden_state
 
 
-class GPT2LMModel(nn.Module):
+class GPT2Model(nn.Module):
     n_layer: int
     n_embd: int
     d_ff: int
     n_head: int
     vocab_size: int
     drop_rate: float
-    n_output: int
     w_init: nn.initializers.Initializer = jax.nn.initializers.truncated_normal(
         0.02)
     b_init: nn.initializers.Initializer = jax.nn.initializers.zeros
@@ -105,9 +104,39 @@ class GPT2LMModel(nn.Module):
             )(hidden_states, attn_mask, training=training)
 
         hidden_states = nn.LayerNorm()(hidden_states)
-        logits = nn.Dense(features=self.n_output,
-                          kernel_init=self.w_init,
-                          bias_init=self.b_init)(hidden_states)
+
+        return hidden_states
+
+
+class GPT2LMHead(nn.Module):
+    n_layer: int
+    n_embd: int
+    d_ff: int
+    n_head: int
+    vocab_size: int
+    drop_rate: float
+    n_output: int
+    w_init: nn.initializers.Initializer = jax.nn.initializers.truncated_normal(
+        0.02)
+    b_init: nn.initializers.Initializer = jax.nn.initializers.zeros
+
+    def setup(self):
+        self.gpt2 = GPT2Model(n_layer=self.n_layer,
+                              n_embd=self.n_embd,
+                              d_ff=self.d_ff,
+                              n_head=self.n_head,
+                              vocab_size=self.vocab_size,
+                              drop_rate=self.drop_rate,
+                              w_init=self.w_init,
+                              b_init=self.b_init)
+
+        self.lm_head = nn.Dense(features=self.n_output,
+                                kernel_init=self.w_init,
+                                bias_init=self.b_init)
+
+    def __call__(self, obs: jnp.ndarray, training=True) -> jnp.ndarray:
+        hidden_states = self.gpt2(obs, training=training)
+        logits = self.lm_head(hidden_states)
 
         return logits
 
@@ -116,13 +145,13 @@ root_key = jax.random.PRNGKey(seed=0)
 main_key, params_key, dropout_key = jax.random.split(key=root_key, num=3)
 
 x = jax.random.randint(main_key, (64, 10), 0, 10)
-model = GPT2LMModel(n_layer=2,
-                    n_embd=16,
-                    d_ff=32,
-                    n_head=2,
-                    vocab_size=41,
-                    drop_rate=0.5,
-                    n_output=41)
+model = GPT2LMHead(n_layer=2,
+                   n_embd=16,
+                   d_ff=32,
+                   n_head=2,
+                   vocab_size=41,
+                   drop_rate=0.5,
+                   n_output=41)
 variables = model.init(params_key, x, training=False)
 params = variables['params']
 pred = model.apply({'params': params},
@@ -185,3 +214,7 @@ for j in range(10):
         pred = jnp.argmax(pred, axis=-1)[-1]
         sample = jnp.concatenate([sample, jnp.array([pred])])
     print(sample)
+
+#
+variables = {'params': state.params}
+base_model, base_model_variables = model.bind(variables).gpt2.unbind()
