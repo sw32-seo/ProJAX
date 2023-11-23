@@ -1,14 +1,16 @@
 # https://flax.readthedocs.io/en/latest/guides/flax_basics.html
-
+import os
+import shutil
 from functools import partial
 from typing import Any, Callable, Optional, Sequence
 
 import flax
 import jax
 import optax
+import orbax.checkpoint
 from flax import linen as nn
-from flax import serialization
-from flax.training import train_state
+from flax import serialization, traverse_util
+from flax.training import orbax_utils, train_state
 from jax import numpy as jnp
 
 
@@ -59,7 +61,7 @@ class GPT2Block(nn.Module):
         # residual connection
         hidden_state = linear_out + residual
 
-        return hidden_state
+        return hidden_state, mask, training
 
 
 class GPT2Model(nn.Module):
@@ -93,8 +95,8 @@ class GPT2Model(nn.Module):
         hidden_states = nn.Dropout(rate=self.drop_rate,
                                    deterministic=not training)(hidden_states)
 
-        for i in range(self.n_layer):
-            hidden_states = GPT2Block(
+        for _ in range(self.n_layer):
+            hidden_states, _, _ = GPT2Block(
                 d_model=self.n_embd,
                 d_ff=self.d_ff,
                 n_head=self.n_head,
@@ -103,7 +105,66 @@ class GPT2Model(nn.Module):
                 drop_rate=self.drop_rate,
             )(hidden_states, attn_mask, training=training)
 
-        hidden_states = nn.LayerNorm()(hidden_states)
+        return hidden_states
+
+
+class FlaxGPT2BaseModel(nn.Module):
+    n_layer: int
+    n_embd: int
+    d_ff: int
+    n_head: int
+    vocab_size: int
+    drop_rate: float
+    w_init: nn.initializers.Initializer = nn.initializers.truncated_normal(
+        stddev=0.02)
+    b_init: nn.initializers.Initializer = nn.initializers.zeros
+    pad_id: int = 42
+
+    def setup(self):
+        self.input_embd = nn.Embed(num_embeddings=self.vocab_size,
+                                   features=self.n_embd,
+                                   name='Input_Embd')
+        self.position_embd = nn.Embed(num_embeddings=300,
+                                      features=self.n_embd,
+                                      name='Learned_PosEmbd')
+        self.dropout = nn.Dropout(rate=self.drop_rate)
+
+        self.gpt2_blocks = nn.Sequential([
+            GPT2Block(d_model=self.n_embd,
+                      d_ff=self.d_ff,
+                      n_head=self.n_head,
+                      w_init=self.w_init,
+                      b_init=self.b_init,
+                      drop_rate=self.drop_rate) for _ in range(self.n_layer)
+        ])
+
+    def __call__(self, obs: jnp.ndarray, training=True):
+        """
+        Compute the output of the block.
+
+        Args:
+            obs (jnp.ndarray): Input observations.
+            training (bool, optional): If True, apply dropout. Defaults to True.
+
+        Returns:
+            jnp.ndarray: Output of the block.
+        """
+        position_id = jnp.arange(obs.shape[-1])
+
+        # Create pad mask when obs element is <pad>
+        pad_attn_mask = nn.make_attention_mask(obs != self.pad_id, obs
+                                               != self.pad_id)
+        causal_attn_mask = nn.make_causal_mask(obs)
+        attn_mask = nn.combine_masks(pad_attn_mask, causal_attn_mask)
+
+        input_embd = self.input_embd(obs)
+        position_embd = self.position_embd(position_id)
+        hidden_states = input_embd + position_embd
+
+        hidden_states = self.dropout(hidden_states, deterministic=not training)
+
+        hidden_states, _, _ = self.gpt2_blocks(hidden_states, attn_mask,
+                                               training)
 
         return hidden_states
 
@@ -121,21 +182,24 @@ class GPT2LMHead(nn.Module):
     b_init: nn.initializers.Initializer = jax.nn.initializers.zeros
 
     def setup(self):
-        self.gpt2 = GPT2Model(n_layer=self.n_layer,
-                              n_embd=self.n_embd,
-                              d_ff=self.d_ff,
-                              n_head=self.n_head,
-                              vocab_size=self.vocab_size,
-                              drop_rate=self.drop_rate,
-                              w_init=self.w_init,
-                              b_init=self.b_init)
+        self.gpt2_base = FlaxGPT2BaseModel(n_layer=self.n_layer,
+                                           n_embd=self.n_embd,
+                                           d_ff=self.d_ff,
+                                           n_head=self.n_head,
+                                           vocab_size=self.vocab_size,
+                                           drop_rate=self.drop_rate,
+                                           w_init=self.w_init,
+                                           b_init=self.b_init)
 
         self.lm_head = nn.Dense(features=self.n_output,
                                 kernel_init=self.w_init,
                                 bias_init=self.b_init)
 
+        self.layer_norm = nn.LayerNorm()
+
     def __call__(self, obs: jnp.ndarray, training=True) -> jnp.ndarray:
-        hidden_states = self.gpt2(obs, training=training)
+        hidden_states = self.gpt2_base(obs, training=training)
+        hidden_states = self.layer_norm(hidden_states)
         logits = self.lm_head(hidden_states)
 
         return logits
@@ -215,6 +279,73 @@ for j in range(10):
         sample = jnp.concatenate([sample, jnp.array([pred])])
     print(sample)
 
-#
+# Transfer learning
 variables = {'params': state.params}
-base_model, base_model_variables = model.bind(variables).gpt2.unbind()
+base_model, base_model_variables = model.bind(variables).gpt2_base.unbind()
+
+
+# Creating a classifier
+class Classifier(nn.Module):
+    num_classes: int
+    backbone: nn.Module
+
+    @nn.compact
+    def __call__(self, obs):
+        hidden_states = self.backbone(obs, training=False)[:, -1]
+        logits = nn.Dense(features=self.num_classes,
+                          name='head',
+                          kernel_init=nn.zeros)(hidden_states)
+        return logits
+
+
+num_classes = 3
+model = Classifier(num_classes=num_classes, backbone=base_model)
+variables = model.init(params_key, x)
+params = variables['params']
+params['backbone'] = base_model_variables['params']
+
+partition_optimizers = {
+    'trainable': optax.adam(5e-3),
+    'frozen': optax.set_to_zero()
+}
+param_partitions = traverse_util.path_aware_map(
+    lambda path, v: 'frozen' if 'backbone' in path else 'trainable', params)
+
+tx = optax.multi_transform(partition_optimizers, param_partitions)
+
+flat = list(traverse_util.flatten_dict(param_partitions).items())
+traverse_util.unflatten_dict(dict(flat[:2] + flat[2:]))
+
+# Creating the `TrainState` as usual:
+state = train_state.TrainState.create(
+    apply_fn=model.apply,
+    params=params,
+    tx=tx,
+)
+
+ckpt = {'model': state}
+
+# Save and load checkpoints with orbax
+orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+save_args = orbax_utils.save_args_from_target(ckpt)
+if os.path.exists('/tmp/ckpt/'):
+    shutil.rmtree('/tmp/ckpt/')
+
+orbax_checkpointer.save('/tmp/ckpt/orbax/single_save',
+                        ckpt,
+                        save_args=save_args)
+
+options = orbax.checkpoint.CheckpointManagerOptions(max_to_keep=2, create=True)
+checkpoint_manager = orbax.checkpoint.CheckpointManager(
+    '/tmp/ckpt/orbax/managed', orbax_checkpointer, options=options)
+
+for step in range(5):
+    checkpoint_manager.save(step, ckpt, save_kwargs={'save_args': save_args})
+
+print(os.listdir('/tmp/ckpt/orbax/managed'))
+
+# Restore the checkpoints with orbax
+raw_restored = orbax_checkpointer.restore('/tmp/ckpt/orbax/single_save')
+raw_restored
+
+raw_managed_restored = checkpoint_manager.restore(4)
