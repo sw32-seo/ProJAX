@@ -6,12 +6,14 @@ from typing import Any, Callable, Optional, Sequence
 
 import flax
 import jax
+import numpy as np
 import optax
 import orbax.checkpoint
 from flax import linen as nn
 from flax import serialization, traverse_util
 from flax.training import orbax_utils, train_state
 from jax import numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec
 
 
 class GPT2Block(nn.Module):
@@ -323,7 +325,9 @@ state = train_state.TrainState.create(
     tx=tx,
 )
 
-ckpt = {'model': state}
+config = {'dimensions': np.array([5, 3])}
+
+ckpt = {'model': state, 'config': config, 'data': [x]}
 
 # Save and load checkpoints with orbax
 orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
@@ -346,6 +350,118 @@ print(os.listdir('/tmp/ckpt/orbax/managed'))
 
 # Restore the checkpoints with orbax
 raw_restored = orbax_checkpointer.restore('/tmp/ckpt/orbax/single_save')
-raw_restored
+print(raw_restored)
 
 raw_managed_restored = checkpoint_manager.restore(4)
+
+# Restore with custom dataclasses
+# you should first provide an example pytree to let Orbax or Flax know exactly which structure to restore to.
+
+empty_state = train_state.TrainState.create(
+    apply_fn=model.apply,
+    params=jax.tree_map(np.zeros_like, variables['params']),
+    tx=tx,
+)
+
+empty_config = {'dimensions': np.array([0, 0])}
+target = {
+    'model': empty_state,
+    'config': empty_config,
+    'data': [jnp.zeros_like(x)]
+}
+state_restored = orbax_checkpointer.restore('/tmp/ckpt/orbax/single_save',
+                                            item=target)
+
+print(state_restored)
+
+# Restore when checkpoint structures differ
+
+
+class CustomTrainState(train_state.TrainState):
+    batch_stats: Any = None
+
+
+custom_state = CustomTrainState.create(apply_fn=model.apply,
+                                       params=params,
+                                       tx=tx,
+                                       batch_stats=np.arange(10))
+
+empty_config = {'dimensions': np.array([0, 0])}
+
+custom_ckpt = {'model': custom_state, 'config': empty_config, 'data': [x]}
+# Use a custom_state to read the old `TrainState` checkpoint
+custom_target = {
+    'model': custom_state,
+    'config': None,
+    'data': [jnp.zeros_like(x)]
+}
+
+# save it on Orbax
+custom_save_args = orbax_utils.save_args_from_target(custom_ckpt)
+checkpoint_manager.save(5,
+                        custom_ckpt,
+                        save_kwargs={'save_args': custom_save_args})
+
+## Scenario 1: When a reference object is partial.
+restored = checkpoint_manager.restore(5, items=target)
+assert not hasattr(restored, 'batch_stats')
+assert type(restored['model']) == train_state.TrainState
+
+## Scenario 2: When a checkpoint is partial
+try:
+    checkpoint_manager.restore(4, items=custom_target)
+except KeyError as e:
+    print(f'KeyError when target state has an unmentioned field: {e}')
+    print('')
+
+# Step 4 is an original `TrainState`, without the `batch_stats`
+custom_restore_args = orbax_utils.restore_args_from_target(custom_target)
+restored = checkpoint_manager.restore(4,
+                                      items=custom_target,
+                                      restore_kwargs={
+                                          'transforms': {},
+                                          'restore_args': custom_restore_args
+                                      })
+assert type(restored['model']) == CustomTrainState
+np.testing.assert_equal(restored['model'].batch_stats,
+                        custom_target['model'].batch_stats)
+restored
+
+# Asynchronized checkpointing
+os.environ["XLA_FLAGS"] = '--xla_force_host_platform_device_count=8'
+jax.distributed.initialize("localhost:8889", num_processes=1, process_id=0)
+
+async_checkpointer = orbax.checkpoint.AsyncCheckpointer(
+    orbax.checkpoint.PyTreeCheckpointHandler(), timeout_secs=50)
+
+# Save your job:
+async_checkpointer.save('/tmp/flax_ckpt/orbax/single_save_async',
+                        ckpt,
+                        save_args=save_args)
+# ... Continue with your work...
+
+# ... Until a time when you want to wait until the save completes:
+async_checkpointer.wait_until_finished()
+print(
+    async_checkpointer.restore('/tmp/flax_ckpt/orbax/single_save_async',
+                               item=target))
+
+# if you are using Orbax `CheckpointManager`, just pass in the async_checkpointer when initializing it.
+async_checkpoint_manager = orbax.checkpoint.CheckpointManager(
+    '/tmp/flax_ckpt/orbax/managed_async', async_checkpointer, options)
+async_checkpoint_manager.wait_until_finished()
+
+# Multi-host/multi-process checkpointing
+## Create an array sharded across multiple devices.
+mesh_shape = (4, 2)
+devices = np.asarray(jax.devices()).reshape(*mesh_shape)
+mesh = jax.sharding.Mesh(devices, ('x', 'y'))
+
+mp_array = jax.device_put(
+    np.arange(8 * 2).reshape(8, 2), NamedSharding(mesh,
+                                                  PartitionSpec('x', 'y')))
+
+# Make it a pytree.
+mp_ckpt = {'model': mp_array}
+async_checkpoint_manager.save(0, mp_ckpt)
+async_checkpoint_manager.wait_until_finished()
